@@ -1,0 +1,127 @@
+name: 'Deploy JS to GCS (minified + gzip, overwrite)'
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.js'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # wichtig für vollständige Git-Historie
+
+      - name: Decode GCP Service Account Key
+        run: echo "${{ secrets.GCP_SA_KEY }}" | base64 -d > "${HOME}/gcp-key.json"
+
+      - name: Authenticate with GCP
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Fetch origin/main
+        run: git fetch origin main
+
+      - name: Detect changed JS file and prepare path
+        id: detect
+        run: |
+          echo "🔍 Suche geänderte JS-Dateien seit dem letzten Commit (auch bei Merge)..."
+          CHANGED=$(git diff --name-only HEAD^1 HEAD | grep '\.js$' | head -n 1 || true)
+      
+          echo "📁 Detected file: $CHANGED"
+      
+          if [ -z "$CHANGED" ]; then
+            echo "❌ Keine geänderte .js-Datei im Commit gefunden. Abbruch."
+            exit 1
+          fi
+      
+          echo "changed_file=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "upload_destination=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Install ESLint
+        run: npm install -g eslint
+
+      - name: Schreibe temporäre ESLint-Konfiguration (ESLint v9+)
+        run: |
+          cat <<EOF > eslint.config.mjs
+          export default [
+            {
+              files: ['**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx'],
+              languageOptions: {
+                ecmaVersion: 'latest',
+                sourceType: 'module'
+              }
+            }
+          ];
+          EOF
+
+      - name: Syntaxprüfung aller geänderten JS/TS-Dateien
+        run: |
+          echo "🔍 Suche geänderte Dateien im Commit..."
+          BASE=$(git merge-base HEAD origin/main)
+          FILES=$(git diff --name-only "$BASE" HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
+
+          if [ -z "$FILES" ]; then
+            echo "ℹ️ Keine JS/TS-Dateien geändert – Syntaxprüfung übersprungen."
+            exit 0
+          fi
+
+          echo "📂 Folgende Dateien werden geprüft:"
+          echo "$FILES"
+          echo "🧪 Führe ESLint Syntax-Check durch..."
+          eslint $FILES || {
+            echo "❌ Syntaxfehler gefunden – Build wird abgebrochen."
+            exit 1
+          }
+
+      - name: Install JS Minifier
+        run: npm install -g uglify-js
+
+      - name: Minify and gzip JS file
+        id: compress
+        run: |
+          SRC="${{ steps.detect.outputs.changed_file }}"
+          echo "🔍 Minifying source: $SRC"
+
+          if [ ! -f "$SRC" ]; then
+            echo "❌ Datei nicht gefunden: $SRC"
+            exit 1
+          fi
+
+          MINIFIED="dist.min.js"
+          GZIPPED="dist.min.js.gz"
+
+          uglifyjs "$SRC" -o "$MINIFIED"
+
+          if [ ! -s "$MINIFIED" ]; then
+            echo "❌ Minified file ist leer oder ungültig: $MINIFIED"
+            exit 1
+          fi
+
+          gzip -c "$MINIFIED" > "$GZIPPED"
+
+          echo "gzipped_file=$GZIPPED" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect compressed file (debug)
+        run: |
+          ls -lh dist.min.js.gz
+          file dist.min.js.gz
+          gunzip -c dist.min.js.gz | head -n 5
+
+      - name: Upload to GCS with metadata
+        run: |
+          DEST="${{ steps.detect.outputs.upload_destination }}"
+          FILE="${{ steps.compress.outputs.gzipped_file }}"
+
+          echo "🚀 Uploading $FILE to gs://${{ secrets.GCS_BUCKET_NAME }}/$DEST"
+
+          gsutil -h "Content-Type: application/javascript" \
+                 -h "Content-Encoding: gzip" \
+                 -h "Cache-Control: public, no-cache" \
+                 cp "$FILE" "gs://${{ secrets.GCS_BUCKET_NAME }}/$DEST"
